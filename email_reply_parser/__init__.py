@@ -36,13 +36,18 @@ class EmailMessage(object):
     """ An email message represents a parsed email body.
     """
 
-    SIG_REGEX = re.compile(r'(--|__|-\w)|(^Sent from my (\w+\s*){1,3})')
-    QUOTE_HDR_REGEX = re.compile('On.*wrote:$')
+    SIG_REGEX = re.compile(r'(--|__|-\w)|(^Sent from (\w+\s*){1,3})')
+    QUOTE_HDR_REGEX = re.compile('^\s*On.*wrote:.*$')
     QUOTED_REGEX = re.compile(r'(>+)')
     HEADER_REGEX = re.compile(r'^(From|Sent|To|Subject): .+')
     _MULTI_QUOTE_HDR_REGEX = r'(?!On.*On\s.+?wrote:)(On\s(.+?)wrote:)'
     MULTI_QUOTE_HDR_REGEX = re.compile(_MULTI_QUOTE_HDR_REGEX, re.DOTALL | re.MULTILINE)
     MULTI_QUOTE_HDR_REGEX_MULTILINE = re.compile(_MULTI_QUOTE_HDR_REGEX, re.DOTALL)
+    YAHOO_BLOCKQUOTE = re.compile("blockquote, div\.yahoo_quoted {[^\}]+}\s?")
+
+    PROMOTIONAL_SIG = [
+        re.compile("Get Outlook for.*<.+>")
+    ]
 
     def __init__(self, text):
         self.fragments = []
@@ -66,6 +71,8 @@ class EmailMessage(object):
         # Fix any outlook style replies, with the reply immediately above the signature boundary line
         #   See email_2_2.txt for an example
         self.text = re.sub('([^\n])(?=\n ?[_-]{7,})', '\\1\n', self.text, re.MULTILINE)
+        # Remove the yahoo blockquote that sometimes occurs in plain/text
+        self.text = self.YAHOO_BLOCKQUOTE.sub("", self.text)
 
         self.lines = self.text.split('\n')
         self.lines.reverse()
@@ -91,17 +98,29 @@ class EmailMessage(object):
 
     def _scan_line(self, line):
         """ Reviews each line in email message and determines fragment type
-
             line - a row of text from an email message
         """
-        is_quote_header = self.QUOTE_HDR_REGEX.match(line) is not None
+        is_quote_header = self.QUOTE_HDR_REGEX.search(line) is not None
         is_quoted = self.QUOTED_REGEX.match(line) is not None
         is_header = is_quote_header or self.HEADER_REGEX.match(line) is not None
+        is_promotional = False
+
+        for promo in self.PROMOTIONAL_SIG:
+            if promo.search(line) is not None:
+                is_promotional = True
+                break
 
         if self.fragment and len(line.strip()) == 0:
             if self.SIG_REGEX.match(self.fragment.lines[-1].strip()):
                 self.fragment.signature = True
                 self._finish_fragment()
+                return
+
+        if is_promotional:
+            self.fragment = Fragment(is_quoted, line, headers=is_header)
+            self.fragment.signature = True
+            self._finish_fragment()
+            return
 
         if self.fragment \
                 and ((self.fragment.headers == is_header and self.fragment.quoted == is_quoted) or
@@ -133,6 +152,8 @@ class EmailMessage(object):
                 self.found_visible = False
                 for f in self.fragments:
                     f.hidden = True
+            elif self.fragment.is_promotional: # if promotional text, then this fragment is not a reply
+                self.fragment.hidden = True
             if not self.found_visible:
                 if self.fragment.quoted \
                         or self.fragment.headers \
@@ -151,12 +172,13 @@ class Fragment(object):
         an Email Message, labeling each part.
     """
 
-    def __init__(self, quoted, first_line, headers=False):
+    def __init__(self, quoted, first_line, headers=False, promotional=False):
         self.signature = False
         self.headers = headers
         self.hidden = False
         self.quoted = quoted
         self._content = None
+        self.is_promotional = promotional
         self.lines = [first_line]
 
     def finish(self):
